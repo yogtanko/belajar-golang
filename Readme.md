@@ -29,9 +29,10 @@ router.Run()
 **Handler Pattern**
 ```go
 func handler(c *gin.Context) {
-    id := c.Param("id")        // ambil parameter URL
-    name := c.Query("name")     // ambil query param
-    c.JSON(200, response)       // kirim response JSON
+    id := c.Param("id")           // parameter URL
+    name := c.Query("name")       // query parameter
+    c.ShouldBindJSON(&user)       // bind JSON request
+    c.JSON(http.StatusOK, resp)   // response JSON
 }
 ```
 
@@ -41,6 +42,12 @@ mu.RLock()  // untuk GET
 mu.Lock()   // untuk POST/PUT/DELETE
 defer mu.Unlock()
 ```
+
+**HTTP Status Code yang Digunakan**
+- `http.StatusOK` (200)
+- `http.StatusCreated` (201)
+- `http.StatusBadRequest` (400)
+- `http.StatusNotFound` (404)
 
 ### Cara Jalankan
 ```bash
