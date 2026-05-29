@@ -1,4 +1,4 @@
-package main
+package basicrouting
 
 import (
 	"errors"
@@ -37,7 +37,7 @@ var users = []User{
 var nextID = 4
 var mu sync.RWMutex
 
-func main() {
+func BasicRouting() {
 	// TODO: Create Gin router
 	router := gin.Default()
 	// TODO: Setup routes
