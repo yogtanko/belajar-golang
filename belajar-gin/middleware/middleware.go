@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -41,12 +42,14 @@ var articles = []Article{
 	{ID: 2, Title: "Web Development with Gin", Content: "Gin is a web framework...", Author: "Jane Smith", CreatedAt: time.Now(), UpdatedAt: time.Now()},
 }
 var nextID = 3
-var mu sync.Mutex
+var mu sync.RWMutex
+var requestCounter atomic.Int64
+var startTime = time.Now()
 
 func Middleware() {
 	// TODO: Create Gin router without default middleware
 	// Use gin.New() instead of gin.Default()
-	router := gin.Default()
+	router := gin.New()
 
 	// TODO: Setup custom middleware in correct order
 	// 1. ErrorHandlerMiddleware (first to catch panics)
@@ -100,7 +103,7 @@ func RequestIDMiddleware() gin.HandlerFunc {
 		c.Set("request_id", requestID)
 		// Add to response header as "X-Request-ID"
 		c.Header("X-Request-ID", requestID)
-
+		requestCounter.Add(1)
 		c.Next()
 	}
 }
@@ -168,14 +171,15 @@ func AuthMiddleware() gin.HandlerFunc {
 
 // CORSMiddleware handles cross-origin requests
 func CORSMiddleware() gin.HandlerFunc {
+	allowedOrigins := map[string]bool{
+		"http://localhost:3000": true,
+		"https://myblog.com":    true,
+	}
+
 	return func(c *gin.Context) {
 		// TODO: Set CORS headers
 		// Allow origins: http://localhost:3000, https://myblog.com
 		origin := c.Request.Header.Get("Origin")
-		allowedOrigins := map[string]bool{
-			"http://localhost:3000": true,
-			"https://myblog.com":    true,
-		}
 
 		if allowedOrigins[origin] {
 			c.Header("Access-Control-Allow-Origin", origin)
@@ -196,7 +200,7 @@ func CORSMiddleware() gin.HandlerFunc {
 
 type IPClient struct {
 	limiter  *rate.Limiter
-	lastSeen time.Time
+	lastSeen atomic.Int64
 }
 
 // RateLimitMiddleware implements rate limiting per IP
@@ -212,7 +216,7 @@ func RateLimitMiddleware() gin.HandlerFunc {
 			time.Sleep(1 * time.Minute)
 			clients.Range(func(key, value any) bool {
 				client := value.(*IPClient)
-				if time.Since(client.lastSeen) > 3*time.Minute {
+				if time.Since(time.Unix(0, client.lastSeen.Load())) > 3*time.Minute {
 					clients.Delete(key)
 				}
 				return true
@@ -223,21 +227,19 @@ func RateLimitMiddleware() gin.HandlerFunc {
 		ip := c.ClientIP()
 
 		var client *IPClient
-		val, exists := clients.Load(ip)
-		if !exists {
-			limit := rate.Every(1 * time.Minute / 100)
-			client = &IPClient{
-				limiter:  rate.NewLimiter(limit, 100),
-				lastSeen: time.Now(),
-			}
-			clients.Store(ip, client)
-		} else {
+		if val, ok := clients.Load(ip); ok {
 			client = val.(*IPClient)
-			client.lastSeen = time.Now()
+		} else {
+			newClient := &IPClient{
+				limiter: rate.NewLimiter(rate.Every(1*time.Minute/100), 100),
+			}
+			actual, _ := clients.LoadOrStore(ip, newClient)
+			client = actual.(*IPClient)
 		}
+		client.lastSeen.Store(time.Now().UnixNano())
 		maxLimit := client.limiter.Burst()
-		remaining := int(client.limiter.Tokens())
-		tokensMissing := float64(maxLimit - remaining)
+		tokensBeforeRequest := int(client.limiter.Tokens())
+		tokensMissing := float64(maxLimit - tokensBeforeRequest)
 		refillRatePerSecond := float64(client.limiter.Limit())
 
 		var resetTime int64
@@ -330,6 +332,8 @@ func ping(c *gin.Context) {
 func getArticles(c *gin.Context) {
 	// TODO: Implement pagination (optional)
 	// TODO: Return articles in standard format
+	mu.RLock()
+	defer mu.RUnlock()
 	c.JSON(http.StatusOK, APIResponse{
 		Success:   true,
 		Data:      articles,
@@ -351,6 +355,8 @@ func getArticle(c *gin.Context) {
 		})
 		return
 	}
+	mu.RLock()
+	defer mu.RUnlock()
 	// TODO: Find article by ID
 	article, i := findArticleByID(id)
 	// TODO: Return 404 if not found
@@ -397,11 +403,14 @@ func createArticle(c *gin.Context) {
 	defer mu.Unlock()
 	article.ID = nextID
 	nextID++
+	article.CreatedAt = time.Now()
+	article.UpdatedAt = time.Now()
 	articles = append(articles, article)
 	// TODO: Return created article
 	c.JSON(http.StatusCreated, APIResponse{
-		Success: true,
-		Data:    article,
+		Success:   true,
+		Data:      article,
+		RequestID: c.GetString("request_id"),
 	})
 }
 
@@ -420,8 +429,8 @@ func updateArticle(c *gin.Context) {
 		return
 	}
 	// TODO: Parse JSON request body
-	var article *Article
-	if err := c.ShouldBindJSON(&article); err != nil {
+	var newArticle *Article
+	if err := c.ShouldBindJSON(&newArticle); err != nil {
 		c.JSON(http.StatusBadRequest, APIResponse{
 			Success:   false,
 			Error:     "Bad Request",
@@ -430,7 +439,7 @@ func updateArticle(c *gin.Context) {
 		})
 		return
 	}
-	if err := validateArticle(*article); err != nil {
+	if err := validateArticle(*newArticle); err != nil {
 		c.JSON(http.StatusUnprocessableEntity, APIResponse{
 			Success:   false,
 			Error:     "Unprocessable Entity",
@@ -442,7 +451,7 @@ func updateArticle(c *gin.Context) {
 	mu.Lock()
 	defer mu.Unlock()
 	// TODO: Find and update article
-	article, i := findArticleByID(id)
+	_, i := findArticleByID(id)
 	if i == -1 {
 		c.JSON(http.StatusNotFound, APIResponse{
 			Success:   false,
@@ -453,11 +462,14 @@ func updateArticle(c *gin.Context) {
 		return
 	}
 	// TODO: Return updated article
-	article.ID = articles[i].ID
-	articles[i] = *article
+	newArticle.ID = articles[i].ID
+	newArticle.CreatedAt = articles[i].CreatedAt
+	newArticle.UpdatedAt = time.Now()
+	articles[i] = *newArticle
 	c.JSON(http.StatusOK, APIResponse{
-		Success: true,
-		Data:    article,
+		Success:   true,
+		Data:      newArticle,
+		RequestID: c.GetString("request_id"),
 	})
 }
 
@@ -475,6 +487,8 @@ func deleteArticle(c *gin.Context) {
 		})
 		return
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	// TODO: Find and remove article
 	_, i := findArticleByID(id)
 	if i == -1 {
@@ -487,12 +501,10 @@ func deleteArticle(c *gin.Context) {
 		return
 	}
 	// TODO: Return success message
-	mu.Lock()
-	defer mu.Unlock()
 	articles = append(articles[:i], articles[i+1:]...)
 	c.JSON(http.StatusOK, APIResponse{
 		Success: true,
-		Message: fmt.Sprintf("User ID = %d Succesfuly Deleted", id),
+		Message: fmt.Sprintf("Article ID = %d Successfully Deleted", id),
 	})
 }
 
@@ -500,10 +512,12 @@ func deleteArticle(c *gin.Context) {
 func getStats(c *gin.Context) {
 	// TODO: Check if user role is "admin"
 	// TODO: Return mock statistics
+	mu.RLock()
+	defer mu.RUnlock()
 	stats := map[string]interface{}{
 		"total_articles": len(articles),
-		"total_requests": 0,
-		"uptime":         "24h",
+		"total_requests": requestCounter.Load(),
+		"uptime":         time.Since(startTime).String(),
 	}
 
 	// TODO: Return stats in standard format
@@ -537,7 +551,7 @@ func findArticleByID(id int) (*Article, int) {
 	// TODO: Implement article lookup
 	for i, article := range articles {
 		if article.ID == id {
-			return &article, i
+			return &articles[i], i
 		}
 	}
 	// Return article pointer and index, or nil and -1 if not found
